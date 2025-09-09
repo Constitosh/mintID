@@ -1,19 +1,23 @@
-// Minimal "Pay then Airdrop" open-policy mint server
-// Node 18+ required
+// Minimal "Pay then Airdrop" open-policy mint server (Option A)
+// Node 18+ (ESM). package.json has "type": "module"
 import 'dotenv/config';
 import express from 'express';
 import Database from 'better-sqlite3';
+import { readFileSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { Lucid, Blockfrost, fromText } from 'lucid-cardano';
 
-const app = express();
-app.use(express.static('public'));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// ---- ENV ----
-const NETWORK = process.env.NETWORK?.trim() || 'Mainnet'; // 'Mainnet' or 'Preprod'
+// ---------- ENV ----------
+const NETWORK = (process.env.NETWORK || 'Mainnet').trim();   // 'Mainnet' | 'Preprod'
 const BLOCKFROST_KEY = process.env.BLOCKFROST_KEY;
 const PRICE = BigInt(process.env.PRICE_LOVELACE || '15000000'); // 15 ADA default
 const POLL_MS = Number(process.env.POLL_INTERVAL_MS || '6000');
 const SERVER_MNEMONIC = process.env.SERVER_MNEMONIC;
+
 if (!BLOCKFROST_KEY || !SERVER_MNEMONIC) {
   console.error('Missing BLOCKFROST_KEY or SERVER_MNEMONIC in .env');
   process.exit(1);
@@ -23,8 +27,14 @@ const BF_URL = NETWORK === 'Mainnet'
   ? 'https://cardano-mainnet.blockfrost.io/api/v0'
   : 'https://cardano-preprod.blockfrost.io/api/v0';
 
-// ---- DB ----
-const db = new Database('mint.sqlite');
+// ---------- APP ----------
+const app = express();
+app.use(express.json());
+// serve your minimal front-end from /public
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// ---------- DB ----------
+const db = new Database(path.join(__dirname, '..', 'mint.sqlite'));
 db.pragma('journal_mode = wal');
 db.exec(`
 CREATE TABLE IF NOT EXISTS mints (
@@ -42,10 +52,10 @@ CREATE TABLE IF NOT EXISTS seen_utxos (
 );
 `);
 
-// ---- Lucid setup ----
+// ---------- Lucid + Policy ----------
 let lucid;
 let serverAddress;
-let policyScriptJson;
+let mintingPolicy; // Lucid MintingPolicy
 let policyId;
 
 async function initLucid() {
@@ -53,36 +63,37 @@ async function initLucid() {
   await lucid.selectWalletFromSeed(SERVER_MNEMONIC);
 
   serverAddress = await lucid.wallet.address();
-
-  // derive payment key hash from the server address
   const addrDetails = lucid.utils.getAddressDetails(serverAddress);
   const keyHash = addrDetails.paymentCredential?.hash;
-  if (!keyHash) throw new Error('Failed to derive payment key hash');
+  if (!keyHash) throw new Error('Failed to derive payment key hash from server address');
 
-  // native script JSON (sig-only, open policy)
+  // Build native script JSON (sig-only, no timelock = open policy)
   const nativeScriptJson = {
     type: 'all',
     scripts: [{ type: 'sig', keyHash }]
   };
 
-  // IMPORTANT: convert JSON -> MintingPolicy
+  // Convert JSON -> MintingPolicy (THIS fixes the "No variant matched" error)
   mintingPolicy = lucid.utils.nativeScriptFromJson(nativeScriptJson);
-
-  // Now we can compute the policyId from the MintingPolicy
   policyId = lucid.utils.mintingPolicyToId(mintingPolicy);
 
   console.log('Server address:', serverAddress);
   console.log('Policy ID:', policyId);
 }
 
-// ---- Helpers ----
-async function fetchJson(path) {
-  const r = await fetch(`${BF_URL}${path}`, {
+// ---------- Helpers ----------
+function loadDesigns() {
+  const p = path.join(__dirname, 'designs.json');
+  return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+async function fetchJson(bfPath) {
+  const r = await fetch(`${BF_URL}${bfPath}`, {
     headers: { project_id: BLOCKFROST_KEY }
   });
   if (!r.ok) {
     const t = await r.text();
-    throw new Error(`Blockfrost ${path} -> ${r.status}: ${t}`);
+    throw new Error(`Blockfrost ${bfPath} -> ${r.status}: ${t}`);
   }
   return r.json();
 }
@@ -96,26 +107,28 @@ function getStakeKeyFromAddr(address) {
   }
 }
 
-function pickRandomDesign() {
-  const designs = JSON.parse(require('node:fs').readFileSync(new URL('./designs.json', import.meta.url)));
+function pickRandomDesign(designs) {
   const i = Math.floor(Math.random() * designs.length);
   return designs[i];
 }
 
 async function mintAndSend(payerAddress, stakeKey, paidTx) {
-  // safety: ensure one-per-stake enforced at DB level too
-  const insert = db.prepare(`INSERT OR IGNORE INTO mints (stake_key, payer_address, paid_tx) VALUES (?, ?, ?)`);
-  const res = insert.run(stakeKey, payerAddress, paidTx);
+  // enforce one-per-stake at DB level first
+  const ins = db.prepare(
+    'INSERT OR IGNORE INTO mints (stake_key, payer_address, paid_tx) VALUES (?, ?, ?)'
+  );
+  const res = ins.run(stakeKey, payerAddress, paidTx);
   if (res.changes === 0) {
     console.log('Duplicate attempt for stake:', stakeKey);
     return;
   }
 
-  const design = pickRandomDesign();
+  const designs = loadDesigns();
+  const design = pickRandomDesign(designs);
   const unit = policyId + fromText(design.name);
 
-  // CIP-25 v2 metadata object for this single asset
-  const metadata721 = {
+  // CIP-25 v2 per-asset metadata
+  const meta721 = {
     [policyId]: {
       [design.name]: {
         name: design.name.replaceAll('_', ' '),
@@ -132,7 +145,7 @@ async function mintAndSend(payerAddress, stakeKey, paidTx) {
 
   const tx = await lucid.newTx()
     .mintAssets({ [unit]: 1n })
-    .attachMetadata(721, metadata721)
+    .attachMetadata(721, meta721)
     .attachMintingPolicy(mintingPolicy)
     .payToAddress(payerAddress, { [unit]: 1n, lovelace: MIN_ADA })
     .complete();
@@ -140,61 +153,59 @@ async function mintAndSend(payerAddress, stakeKey, paidTx) {
   const signed = await tx.sign().complete();
   const txHash = await signed.submit();
 
-  db.prepare(`UPDATE mints SET minted_tx=?, asset_name=? WHERE paid_tx=?`)
+  db.prepare('UPDATE mints SET minted_tx=?, asset_name=? WHERE paid_tx=?')
     .run(txHash, design.name, paidTx);
 
   console.log(`Minted ${design.name} to ${payerAddress} in tx ${txHash}`);
   return txHash;
 }
 
-// ---- Watcher ----
-// We look for new UTxOs at the server address that are exactly PRICE lovelace (5 ADA) with no other assets.
+// ---------- Watcher (polls your mint address for EXACT 5 ADA) ----------
 async function scanForPayments() {
   try {
     const utxos = await fetchJson(`/addresses/${serverAddress}/utxos?order=desc&count=100`);
     for (const u of utxos) {
       const utxoId = `${u.tx_hash}#${u.output_index}`;
       // skip if already processed
-      const seen = db.prepare(`SELECT 1 FROM seen_utxos WHERE utxo=?`).get(utxoId);
+      const seen = db.prepare('SELECT 1 FROM seen_utxos WHERE utxo=?').get(utxoId);
       if (seen) continue;
 
-      // amount is an array like [{unit:'lovelace', quantity:'5000000'}, ...]
+      // only lovelace, exactly PRICE
       const onlyLovelace = u.amount.length === 1 && u.amount[0].unit === 'lovelace';
       const qty = onlyLovelace ? BigInt(u.amount[0].quantity) : 0n;
       if (!(onlyLovelace && qty === PRICE)) {
-        // mark as seen to avoid re-checking spam outputs
-        db.prepare(`INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)`).run(utxoId);
+        db.prepare('INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)').run(utxoId);
         continue;
       }
 
-      // Find the payer's address from tx inputs
+      // find payer address from inputs
       const txUtxos = await fetchJson(`/txs/${u.tx_hash}/utxos`);
       const firstInput = txUtxos?.inputs?.[0];
       const payerAddr = firstInput?.address;
       if (!payerAddr) {
         console.warn('No payer address found for tx', u.tx_hash);
-        db.prepare(`INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)`).run(utxoId);
+        db.prepare('INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)').run(utxoId);
         continue;
       }
+
       const stakeKey = getStakeKeyFromAddr(payerAddr);
       if (!stakeKey) {
         console.warn('No stake key on payer address; skipping tx', u.tx_hash);
-        db.prepare(`INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)`).run(utxoId);
+        db.prepare('INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)').run(utxoId);
         continue;
       }
 
-      // Enforce one-per-stake
-      const already = db.prepare(`SELECT 1 FROM mints WHERE stake_key=?`).get(stakeKey);
+      // one-per-stake enforcement
+      const already = db.prepare('SELECT 1 FROM mints WHERE stake_key=?').get(stakeKey);
       if (already) {
         console.log('Stake already minted; ignoring payment', stakeKey, u.tx_hash);
-        db.prepare(`INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)`).run(utxoId);
+        db.prepare('INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)').run(utxoId);
         continue;
       }
 
-      // Proceed to mint and send
       try {
         const mintedTx = await mintAndSend(payerAddr, stakeKey, u.tx_hash);
-        db.prepare(`INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)`).run(utxoId);
+        db.prepare('INSERT OR IGNORE INTO seen_utxos (utxo) VALUES (?)').run(utxoId);
         if (mintedTx) console.log('Processed payment', u.tx_hash, '->', mintedTx);
       } catch (e) {
         console.error('Mint failed for', u.tx_hash, e);
@@ -205,7 +216,7 @@ async function scanForPayments() {
   }
 }
 
-// ---- API ----
+// ---------- API ----------
 app.get('/api/info', async (_req, res) => {
   res.json({
     network: NETWORK,
@@ -215,25 +226,25 @@ app.get('/api/info', async (_req, res) => {
   });
 });
 
-// Optional: user signs a message client-side and posts it here just for audit
+// Optional: save signed intent blobs for audit
 app.post('/api/intent', async (req, res) => {
-  // store the signed blob in DB if you want; for simplicity we just ack
+  // You could insert into DB here if desired
   res.json({ ok: true });
 });
 
-// Status by stake key (very basic)
+// Simple status by stake key
 app.get('/api/status/:stake', (req, res) => {
-  const row = db.prepare(`SELECT * FROM mints WHERE stake_key=?`).get(req.params.stake);
+  const row = db.prepare('SELECT * FROM mints WHERE stake_key=?').get(req.params.stake);
   if (!row) return res.json({ status: 'none' });
   if (!row.minted_tx) return res.json({ status: 'paid', paid_tx: row.paid_tx });
   return res.json({ status: 'minted', minted_tx: row.minted_tx, asset: row.asset_name });
 });
 
-// ---- Boot ----
+// ---------- Boot ----------
 const PORT = process.env.PORT || 3003;
 initLucid().then(() => {
   app.listen(PORT, () => console.log('Mint server on :' + PORT));
+  // start polling
   setInterval(scanForPayments, POLL_MS);
-  // do an immediate scan on boot
-  scanForPayments();
+  scanForPayments(); // immediate pass
 });
