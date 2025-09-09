@@ -51,17 +51,26 @@ let policyId;
 async function initLucid() {
   lucid = await Lucid.new(new Blockfrost(BF_URL, BLOCKFROST_KEY), NETWORK);
   await lucid.selectWalletFromSeed(SERVER_MNEMONIC);
+
   serverAddress = await lucid.wallet.address();
+
+  // derive payment key hash from the server address
   const addrDetails = lucid.utils.getAddressDetails(serverAddress);
   const keyHash = addrDetails.paymentCredential?.hash;
-  if (!keyHash) {
-    throw new Error('Failed to derive payment key hash');
-  }
-  policyScriptJson = {
+  if (!keyHash) throw new Error('Failed to derive payment key hash');
+
+  // native script JSON (sig-only, open policy)
+  const nativeScriptJson = {
     type: 'all',
     scripts: [{ type: 'sig', keyHash }]
   };
-  policyId = lucid.utils.mintingPolicyToId(policyScriptJson);
+
+  // IMPORTANT: convert JSON -> MintingPolicy
+  mintingPolicy = lucid.utils.nativeScriptFromJson(nativeScriptJson);
+
+  // Now we can compute the policyId from the MintingPolicy
+  policyId = lucid.utils.mintingPolicyToId(mintingPolicy);
+
   console.log('Server address:', serverAddress);
   console.log('Policy ID:', policyId);
 }
