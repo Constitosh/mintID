@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { Lucid, Blockfrost, fromText } from 'lucid-cardano';
 
 const app = express();
-app.use(express.json());
+app.use(express.static('public'));
 
 // ---- ENV ----
 const NETWORK = process.env.NETWORK?.trim() || 'Mainnet'; // 'Mainnet' or 'Preprod'
