@@ -133,7 +133,7 @@ async function mintAndSend(payerAddress, stakeKey, paidTx) {
   const tx = await lucid.newTx()
     .mintAssets({ [unit]: 1n })
     .attachMetadata(721, metadata721)
-    .attachMintingPolicy(policyScriptJson)
+    .attachMintingPolicy(mintingPolicy)
     .payToAddress(payerAddress, { [unit]: 1n, lovelace: MIN_ADA })
     .complete();
 
