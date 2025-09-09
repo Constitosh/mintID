@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 // ---------- ENV ----------
 const NETWORK = (process.env.NETWORK || 'Mainnet').trim();   // 'Mainnet' | 'Preprod'
 const BLOCKFROST_KEY = process.env.BLOCKFROST_KEY;
-const PRICE = BigInt(process.env.PRICE_LOVELACE || '15000000'); // 15 ADA default
+const PRICE = BigInt(process.env.PRICE_LOVELACE || '1000000'); // 15 ADA default
 const POLL_MS = Number(process.env.POLL_INTERVAL_MS || '6000');
 const SERVER_MNEMONIC = process.env.SERVER_MNEMONIC;
 
